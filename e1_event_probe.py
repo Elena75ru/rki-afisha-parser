@@ -1,8 +1,6 @@
 # -*- coding: utf-8 -*-
-# e1_event_probe.py (исправленная диагностическая версия)
-# Исследование разметки карточек событий https://www.e1.ru/afisha/
-# через BeautifulSoup в исполнителе Salebot.
-# Без формирования подтверждённого события: только кандидаты и их контейнеры.
+# e1_event_probe.py (этап: list/card, извлечение полей внутри <a>, карточка «Аффинаж»)
+# Два отдельных режима через params.stage. Без платных сервисов.
 import json
 import re
 
@@ -24,18 +22,20 @@ except Exception as exc:
 
 from urllib.parse import urljoin, urlparse
 
+# Русские названия месяцев для поиска даты в тексте ссылки
+MONTHS = ["января", "февраля", "марта", "апреля", "мая", "июня",
+          "июля", "августа", "сентября", "октября", "ноября", "декабря"]
+
+CARD_URL = "https://www.e1.ru/afisha/concert/affinazh-id16141586/"
+LIST_URL = "https://www.e1.ru/afisha/"
+
 
 def _is_event_card_url(href, base_url):
-    """Ссылка считается карточкой события, только если после urljoin
-    домен совпадает и путь имеет вид /afisha/...-id<число>.
-    Это ограниченный признак для первого теста, не универсальное правило."""
     full = urljoin(base_url, href)
     parsed = urlparse(full)
     base = urlparse(base_url)
-    # домен совпадает с базовым
     if parsed.netloc != base.netloc:
         return False, full
-    # путь /afisha/... с суффиксом -id<число> в конце сегмента
     if "/afisha/" not in parsed.path:
         return False, full
     if re.search(r"-id\d+", parsed.path):
@@ -43,28 +43,159 @@ def _is_event_card_url(href, base_url):
     return False, full
 
 
-def _container_info(container, base_url):
-    """Тег, классы, текст и число разных ссылок-кандидатов внутри контейнера."""
-    classes = container.get("class") or []
-    tag = container.name
-    text = container.get_text(separator=" ", strip=True)
-    # считаем разные ссылки-кандидаты на события внутри контейнера
-    cand_hrefs = set()
-    for a in container.find_all("a", href=True):
-        ok, _ = _is_event_card_url(a["href"], base_url)
-        if ok:
-            cand_hrefs.add(a["href"])
+def _extract_from_link(a, base_url):
+    """Поля ТОЛЬКО внутри конкретного <a>. Дату ищем по названию месяца,
+    не по любому русскому слову. Год не подставляем."""
+    href = a.get("href", "").strip()
+    ok, full = _is_event_card_url(href, base_url)
+    if not ok:
+        return None
+
+    link_text = a.get_text(separator=" ", strip=True)
+    source = "link_text"
+
+    date_raw = None
+    time_raw = None
+    age = None
+    genre = None
+
+    # дата: «N месяц» — число + одно из названий месяцев, год НЕ добавляем
+    m_date = re.search(r"(\d{1,2}\s+(?:" + "|".join(MONTHS) + r"))", link_text)
+    if m_date:
+        date_raw = m_date.group(1)
+
+    m_time = re.search(r"(\d{1,2}:\d{2})", link_text)
+    if m_time:
+        time_raw = m_time.group(1)
+
+    m_age = re.search(r"(\d{1,2}\+)\s*•", link_text)
+    if m_age:
+        age = m_age.group(1)
+
+    m_genre = re.search(r"•\s*([^•]+)$", link_text)
+    if m_genre:
+        genre = m_genre.group(1).strip()
+
+    # название: всё до даты (если дата найдена)
+    name = link_text
+    if date_raw:
+        idx = link_text.find(date_raw)
+        if idx > 0:
+            name = link_text[:idx].strip()
+    name = name or None
+
     return {
-        "tag": tag,
-        "classes": classes,
-        "text": text[:300],
-        "distinct_event_candidate_links": len(cand_hrefs),
+        "name": name,
+        "date_raw": date_raw,      # без года
+        "date_full": None,         # null, пока не подтверждено
+        "time": time_raw,
+        "age": age,
+        "genre": genre,
+        "url": full,
+        "link_text": link_text,
+        "source": source,
+    }
+
+
+def _stage_list(params):
+    resp = requests.get(LIST_URL, timeout=(4.0, 6.0),
+                        headers={"User-Agent": "Mozilla/5.0 (compatible; Salebot test)"})
+    resp.raise_for_status()
+    soup = BeautifulSoup(resp.content, "html.parser")
+    final_url = resp.url
+
+    candidates = []
+    seen = set()
+    for a in soup.find_all("a", href=True):
+        href = a["href"].strip()
+        if not href or href in seen:
+            continue
+        card = _extract_from_link(a, final_url)
+        if card:
+            seen.add(href)
+            candidates.append(card)
+
+    total_found = len(candidates)
+    returned = candidates[:5]
+
+    return {
+        "ok": True,
+        "status": resp.status_code,
+        "final_url": final_url,
+        "stage": "list",
+        "candidates_total": total_found,
+        "candidates_returned": len(returned),
+        "extraction_ok": total_found > 0,   # не безусловно
+        "candidates": returned,
+        # происхождение: кандидаты собраны со всей страницы афиши;
+        # блок, из которого они взяты, в коде не зафиксирован
+        "section": "whole page; originating block not fixed in code",
+    }
+
+
+def _stage_card(params):
+    resp = requests.get(CARD_URL, timeout=(4.0, 6.0),
+                        headers={"User-Agent": "Mozilla/5.0 (compatible; Salebot test)"})
+    resp.raise_for_status()
+    soup = BeautifulSoup(resp.content, "html.parser")
+    final_url = resp.url
+
+    title = soup.title.get_text(strip=True) if soup.title else None
+    h1_tag = soup.find("h1")
+    h1 = h1_tag.get_text(strip=True) if h1_tag is not None else None
+
+    # структурированные данные — если есть, сохраняем структуру целиком
+    ld_objects = []
+    for ld in soup.find_all("script", type="application/ld+json"):
+        try:
+            ld_objects.append(json.loads(ld.get_text()))
+        except Exception:
+            pass
+
+    # короткий фрагмент текста ВОКРУГ названия/расписания/площадки,
+    # если такой фрагмент найден (не первые 600 символов навигации)
+    for tag in soup(["script", "style"]):
+        tag.decompose()
+    text = soup.get_text(separator=" ", strip=True)
+
+    # ищем фрагмент около названия события из title/h1
+    probe = None
+    target = None
+    for cand in (h1, title):
+        if cand:
+            # берём первое вхождение в тексте и окно вокруг него
+            idx = text.find(cand)
+            if idx != -1:
+                target = cand
+                probe = text[max(0, idx - 150): idx + 250]
+                break
+    if probe is None:
+        # если названия в тексте нет — короткий фрагмент середины текста
+        mid = len(text) // 2
+        probe = text[mid: mid + 400]
+
+    return {
+        "ok": True,
+        "status": resp.status_code,
+        "final_url": final_url,
+        "stage": "card",
+        "title": title,
+        "h1": h1,
+        "ld_objects": ld_objects,          # структура сохранена, связи не сплющивались
+        "text_fragment_around_name": probe,
+        "session_date": None,               # не подтверждено — null
+        "session_time": None,
+        "price": None,
+        "address": None,
+        "venue": None,
+        "event_verified": False,
+        # source для полей: где они найдены (здесь — из ld_objects, если разобрано,
+        # иначе null). Связываем только с конкретным объектом.
+        "fields_source": "ld_objects (structure kept) — to be read per object",
     }
 
 
 def handle(data):
-    url = "https://www.e1.ru/afisha/"
-
     try:
         try:
             params = json.loads(data) if data else {}
@@ -81,79 +212,21 @@ def handle(data):
                 ensure_ascii=False,
             )
 
-        resp = requests.get(
-            url,
-            timeout=(4.0, 6.0),
-            headers={"User-Agent": "Mozilla/5.0 (compatible; Salebot test)"},
-        )
-        resp.raise_for_status()
+        stage = params.get("stage")
 
-        soup = BeautifulSoup(resp.content, "html.parser")
-        status = resp.status_code
-        final_url = resp.url
-
-        # Кандидаты: ТОЛЬКО ссылки вида /afisha/...-id<число>, не разделы меню
-        candidates = []
-        seen = set()
-        for a in soup.find_all("a", href=True):
-            href = a["href"].strip()
-            if not href or href in seen:
-                continue
-            ok, full = _is_event_card_url(href, final_url)
-            if ok:
-                seen.add(href)
-                candidates.append((a, full))
-
-        if not candidates:
+        if stage == "list":
+            result = _stage_list(params)
+        elif stage == "card":
+            result = _stage_card(params)
+        else:
             return json.dumps(
-                {
-                    "ok": True,
-                    "status": status,
-                    "final_url": final_url,
-                    "event_verified": False,
-                    "candidates_found": 0,
-                    "candidates": [],
-                    "note": "no event-card candidates (-id<number>) found on this page",
-                },
+                {"ok": False,
+                 "error": "unknown stage: {}".format(stage),
+                 "expected": ["list", "card"]},
                 ensure_ascii=False,
             )
 
-        # До трёх кандидатов: текст ссылки, URL, фрагменты ссылки и ближайших контейнеров
-        result_candidates = []
-        for a, full in candidates[:3]:
-            link_text = a.get_text(strip=True)
-            link_fragment = str(a)[:400]
-
-            # ближайшие родительские контейнеры (по возрастанию глубины)
-            containers = []
-            current = a
-            for _ in range(4):  # ограниченно, без безусловного подъёма на 6
-                parent = current.parent
-                if parent is None or parent.name in ("html", "body"):
-                    break
-                containers.append(_container_info(parent, final_url))
-                current = parent
-
-            result_candidates.append(
-                {
-                    "link_text": link_text or None,
-                    "url": full,
-                    "link_fragment": link_fragment,
-                    "containers": containers,
-                }
-            )
-
-        return json.dumps(
-            {
-                "ok": True,
-                "status": status,
-                "final_url": final_url,
-                "event_verified": False,
-                "candidates_found": len(candidates),
-                "candidates": result_candidates,
-            },
-            ensure_ascii=False,
-        )
+        return json.dumps(result, ensure_ascii=False)
 
     except Exception as exc:
         return json.dumps(
