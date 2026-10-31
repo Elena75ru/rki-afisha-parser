@@ -1,8 +1,10 @@
 # -*- coding: utf-8 -*-
-# e1_event_probe.py
+# e1_event_probe.py (исправленная диагностическая версия)
 # Исследование разметки карточек событий https://www.e1.ru/afisha/
-# через BeautifulSoup в исполнителе Salebot. Без платных сервисов.
+# через BeautifulSoup в исполнителе Salebot.
+# Без формирования подтверждённого события: только кандидаты и их контейнеры.
 import json
+import re
 
 try:
     from bs4 import BeautifulSoup
@@ -20,47 +22,43 @@ except Exception as exc:
     REQUESTS_AVAILABLE = False
     REQUESTS_ERROR = "{}: {}".format(type(exc).__name__, exc)
 
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse
 
 
-def _probe_card(a, final_url):
-    """Пытается вытащить данные из контейнера ссылки-кандидата.
-    Возвращает dict или None, если контейнер не даёт связанной записи."""
-    href = a.get("href", "").strip()
-    if not href:
-        return None
-    container = a
-    for _ in range(6):  # поднимаемся к ближайшему контейнеру-обёртке
-        parent = container.parent
-        if parent is None or parent.name in ("html", "body"):
-            break
-        container = parent
+def _is_event_card_url(href, base_url):
+    """Ссылка считается карточкой события, только если после urljoin
+    домен совпадает и путь имеет вид /afisha/...-id<число>.
+    Это ограниченный признак для первого теста, не универсальное правило."""
+    full = urljoin(base_url, href)
+    parsed = urlparse(full)
+    base = urlparse(base_url)
+    # домен совпадает с базовым
+    if parsed.netloc != base.netloc:
+        return False, full
+    # путь /afisha/... с суффиксом -id<число> в конце сегмента
+    if "/afisha/" not in parsed.path:
+        return False, full
+    if re.search(r"-id\d+", parsed.path):
+        return True, full
+    return False, full
 
-    name = a.get_text(strip=True)
-    full_url = urljoin(final_url, href)
 
-    # Дата/время/площадка — если они лежат в том же контейнере
-    text_block = container.get_text(separator=" ", strip=True)
-    date_hint = None
-    time_hint = None
-    place_hint = None
-
-    import re
-    m_date = re.search(r"(\d{1,2}\.\d{2}\.\d{4})", text_block)
-    if m_date:
-        date_hint = m_date.group(1)
-    m_time = re.search(r"(\d{1,2}:\d{2})", text_block)
-    if m_time:
-        time_hint = m_time.group(1)
-
+def _container_info(container, base_url):
+    """Тег, классы, текст и число разных ссылок-кандидатов внутри контейнера."""
+    classes = container.get("class") or []
+    tag = container.name
+    text = container.get_text(separator=" ", strip=True)
+    # считаем разные ссылки-кандидаты на события внутри контейнера
+    cand_hrefs = set()
+    for a in container.find_all("a", href=True):
+        ok, _ = _is_event_card_url(a["href"], base_url)
+        if ok:
+            cand_hrefs.add(a["href"])
     return {
-        "name": name or None,
-        "url": full_url,
-        "date": date_hint,
-        "time": time_hint,
-        "place": place_hint,
-        "container_html": str(container)[:1200],
-        "container_text": text_block[:600],
+        "tag": tag,
+        "classes": classes,
+        "text": text[:300],
+        "distinct_event_candidate_links": len(cand_hrefs),
     }
 
 
@@ -90,67 +88,69 @@ def handle(data):
         )
         resp.raise_for_status()
 
-        body = resp.content
-        soup = BeautifulSoup(body, "html.parser")
+        soup = BeautifulSoup(resp.content, "html.parser")
         status = resp.status_code
         final_url = resp.url
 
-        # Кандидаты в карточки событий: ссылки, чей URL выглядит как
-        # карточка мероприятия (id в пути). Без выдуманных CSS-классов.
-        import re
+        # Кандидаты: ТОЛЬКО ссылки вида /afisha/...-id<число>, не разделы меню
         candidates = []
+        seen = set()
         for a in soup.find_all("a", href=True):
             href = a["href"].strip()
-            if not href:
+            if not href or href in seen:
                 continue
-            if re.search(r"-id\d+", href) or "/afisha/" in href:
-                candidates.append(a)
+            ok, full = _is_event_card_url(href, final_url)
+            if ok:
+                seen.add(href)
+                candidates.append((a, full))
 
-        # Убираем повторы по href
-        seen = set()
-        uniq = []
-        for a in candidates:
-            h = a["href"].strip()
-            if h not in seen:
-                seen.add(h)
-                uniq.append(a)
-        candidates = uniq
-
-        # Берём первые до 5 и пробуем извлечь связанную запись
-        cards = []
-        for a in candidates[:5]:
-            card = _probe_card(a, final_url)
-            if card:
-                cards.append(card)
-
-        if not cards:
+        if not candidates:
             return json.dumps(
                 {
-                    "ok": False,
+                    "ok": True,
                     "status": status,
                     "final_url": final_url,
-                    "reason": "no event-card candidates found or no container yielded a related record",
-                    "candidates_found": len(candidates),
+                    "event_verified": False,
+                    "candidates_found": 0,
+                    "candidates": [],
+                    "note": "no event-card candidates (-id<number>) found on this page",
                 },
                 ensure_ascii=False,
             )
 
-        # Первая успешная карточка — результат
-        first = cards[0]
+        # До трёх кандидатов: текст ссылки, URL, фрагменты ссылки и ближайших контейнеров
+        result_candidates = []
+        for a, full in candidates[:3]:
+            link_text = a.get_text(strip=True)
+            link_fragment = str(a)[:400]
+
+            # ближайшие родительские контейнеры (по возрастанию глубины)
+            containers = []
+            current = a
+            for _ in range(4):  # ограниченно, без безусловного подъёма на 6
+                parent = current.parent
+                if parent is None or parent.name in ("html", "body"):
+                    break
+                containers.append(_container_info(parent, final_url))
+                current = parent
+
+            result_candidates.append(
+                {
+                    "link_text": link_text or None,
+                    "url": full,
+                    "link_fragment": link_fragment,
+                    "containers": containers,
+                }
+            )
+
         return json.dumps(
             {
                 "ok": True,
                 "status": status,
                 "final_url": final_url,
-                "event": {
-                    "name": first["name"],
-                    "url": first["url"],
-                    "date": first["date"],
-                    "time": first["time"],
-                    "place": first["place"],
-                },
-                "container_html": first["container_html"],
-                "container_text": first["container_text"],
+                "event_verified": False,
+                "candidates_found": len(candidates),
+                "candidates": result_candidates,
             },
             ensure_ascii=False,
         )
